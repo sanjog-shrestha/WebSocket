@@ -1,0 +1,13 @@
+{
+    "name": "ws-echo-server",
+    "version": "1.0.0",
+    "description": "Checkpoint 5: scaled chat with Redis pub/sub",
+    "main": "index.js",
+    "scripts": {
+        "start": "node index.js"
+    },
+    "dependencies": {
+        "ws": "^8.18.0",
+        "redis": "^4.7.0"
+    }
+}
