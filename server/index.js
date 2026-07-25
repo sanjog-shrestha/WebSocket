@@ -40,6 +40,13 @@ function roomMemberCountLocal(room) {
     return count;
 }
 
+// Redis key holding the set of usernames currently active in a room,	 
+// shared by every server instance. SADD is atomic, so two instances	 
+// racing to claim the same name at the same time can't both win.
+function usernameSetKey(room) {
+    return `room:${room}:usernames`;
+}
+
 async function start() {
     await publisher.connect();
     await subscriber.connect();
@@ -54,7 +61,7 @@ async function start() {
     wss.on('connection', (ws) => {
         console.log(`[${SERVER_ID}] New socket opened, awaiting join message...`);
 
-        ws.on('message', (raw) => {
+        ws.on('message', async (raw) => {
             let data;
             try {
                 data = JSON.parse(raw.toString());
@@ -68,6 +75,19 @@ async function start() {
 
                 if (!username) {
                     ws.send(JSON.stringify({ type: 'error', message: 'Username cannot be empty.' }));
+                    return;
+                }
+
+                // Atomically claim the username in this room across ALL instances.	 
+                // sAdd returns the number of NEW members added: 1 if we won the	 
+                // claim, 0 if someone (on any instance) already holds it.
+                const claimed = await publisher.sAdd(usernameSetKey(room), username);
+
+                if (claimed === 0) {
+                    ws.send(JSON.stringify({
+                        type: 'error',
+                        message: `Username "${username}" is already taken in #${room}. Pick another.`
+                    }));
                     return;
                 }
 
@@ -102,10 +122,12 @@ async function start() {
             }
         });
 
-        ws.on('close', () => {
+        ws.on('close', async () => {
             const info = clients.get(ws);
             if (info) {
                 clients.delete(ws);
+                // Free the username so someone else (on any instance) can take it.
+                await publisher.sRem(usernameSetKey(info.room), info.username);
                 console.log(`[${SERVER_ID}] ${info.username} left #${info.room}`);
                 publishToRoom(info.room, {
                     type: 'system',
