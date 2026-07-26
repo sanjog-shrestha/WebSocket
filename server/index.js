@@ -4,20 +4,19 @@ const { createClient } = require('redis');
 const PORT = process.env.PORT || 8080;
 const REDIS_URL = process.env.REDIS_URL || 'redis://redis:6379';
 const SERVER_ID = process.env.SERVER_ID || 'unknown';
-const CHANNEL = 'chat-messages';
+const STREAM_KEY = 'chat-stream';
+const STREAM_MAXLEN = 5000;
+const HISTORY_LIMIT = 50;
 
 const wss = new WebSocket.Server({ port: PORT });
 
-// Sockets connected to THIS instance only: ws -> { username, room }
 const clients = new Map();
 
-// Redis requires two separate connections: one for publishing,
-// one dedicated to subscribing (a client in subscribe mode can't
-// run other commands).
-const publisher = createClient({ url: REDIS_URL });
-const subscriber = createClient({ url: REDIS_URL });
+const redisClient = createClient({ url: REDIS_URL });
+const streamReader = createClient({ url: REDIS_URL });
 
-// Send a payload to every LOCAL client in a given room.
+let lastStreamId = '0';
+
 function relayToLocalRoom(room, payload) {
     const data = JSON.stringify(payload);
     for (const [socket, info] of clients.entries()) {
@@ -27,11 +26,44 @@ function relayToLocalRoom(room, payload) {
     }
 }
 
-// Instead of broadcasting directly, publish to Redis. EVERY instance
-// (including this one) will receive it via the subscriber callback below	 
-// and relay it to its own local clients.
-function publishToRoom(room, payload) {
-    publisher.publish(CHANNEL, JSON.stringify({ ...payload, room }));
+async function appendToStream(room, payload) {
+    await redisClient.xAdd(
+        STREAM_KEY,
+        '*',
+        { data: JSON.stringify({ ...payload, room }) },
+        { TRIM: { strategy: 'MAXLEN', strategyModifier: '~', threshold: STREAM_MAXLEN } }
+    );
+}
+
+function usernameSetKey(room) {
+    return `room:${room}:usernames`;
+}
+
+async function runStreamReader() {
+    const latest = await redisClient.xRevRange(STREAM_KEY, '+', '-', { COUNT: 1 });
+    lastStreamId = latest.length > 0 ? latest[0].id : '0';
+    console.log(`[${SERVER_ID}] Stream reader starting after ID ${lastStreamId}`);
+
+    for (; ;) {
+        try {
+            const result = await streamReader.xRead(
+                { key: STREAM_KEY, id: lastStreamId },
+                { BLOCK: 0, COUNT: 100 }
+            );
+            if (!result) continue;
+
+            for (const stream of result) {
+                for (const entry of stream.messages) {
+                    lastStreamId = entry.id;
+                    const payload = JSON.parse(entry.message.data);
+                    relayToLocalRoom(payload.room, payload);
+                }
+            }
+        } catch (err) {
+            console.error(`[${SERVER_ID}] Stream reader error:`, err.message);
+            await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+    }
 }
 
 function roomMemberCountLocal(room) {
@@ -40,21 +72,20 @@ function roomMemberCountLocal(room) {
     return count;
 }
 
-// Redis key holding the set of usernames currently active in a room,	 
-// shared by every server instance. SADD is atomic, so two instances	 
-// racing to claim the same name at the same time can't both win.
-function usernameSetKey(room) {
-    return `room:${room}:usernames`;
+async function fetchHistoryUpTo(room, upToId) {
+    if (upToId === '0') return [];
+    const entries = await redisClient.xRange(STREAM_KEY, '-', upToId);
+    return entries
+        .map((e) => JSON.parse(e.message.data))
+        .filter((p) => p.room === room && p.type === 'chat')
+        .slice(-HISTORY_LIMIT);
 }
 
 async function start() {
-    await publisher.connect();
-    await subscriber.connect();
+    await redisClient.connect();
+    await streamReader.connect();
 
-    await subscriber.subscribe(CHANNEL, (rawMessage) => {
-        const payload = JSON.parse(rawMessage);
-        relayToLocalRoom(payload.room, payload);
-    });
+    runStreamReader();
 
     console.log(`[${SERVER_ID}] Connected to Redis. WebSocket server on port ${PORT}`);
 
@@ -78,11 +109,7 @@ async function start() {
                     return;
                 }
 
-                // Atomically claim the username in this room across ALL instances.	 
-                // sAdd returns the number of NEW members added: 1 if we won the	 
-                // claim, 0 if someone (on any instance) already holds it.
-                const claimed = await publisher.sAdd(usernameSetKey(room), username);
-
+                const claimed = await redisClient.sAdd(usernameSetKey(room), username);
                 if (claimed === 0) {
                     ws.send(JSON.stringify({
                         type: 'error',
@@ -92,11 +119,17 @@ async function start() {
                 }
 
                 clients.set(ws, { username, room });
-                console.log(`[${SERVER_ID}] ${username} joined #${room} (local count: ${roomMemberCountLocal(room)})`);
+                const snapshotId = lastStreamId;
 
+                console.log(`[${SERVER_ID}] ${username} joined #${room} (local count: ${roomMemberCountLocal(room)})`);
                 ws.send(JSON.stringify({ type: 'joined', username, room, server: SERVER_ID }));
 
-                publishToRoom(room, {
+                const history = await fetchHistoryUpTo(room, snapshotId);
+                if (history.length > 0) {
+                    ws.send(JSON.stringify({ type: 'history', messages: history }));
+                }
+
+                await appendToStream(room, {
                     type: 'system',
                     message: `${username} joined #${room} (handled by ${SERVER_ID})`,
                     timestamp: new Date().toISOString()
@@ -106,13 +139,13 @@ async function start() {
 
             if (data.type === 'chat') {
                 const info = clients.get(ws);
-                if (!info) return; // hasn't joined yet
+                if (!info) return;
 
                 const text = (data.message || '').toString().slice(0, 500);
                 if (!text) return;
 
                 console.log(`[${SERVER_ID}] [#${info.room}] ${info.username}: ${text}`);
-                publishToRoom(info.room, {
+                await appendToStream(info.room, {
                     type: 'chat',
                     from: info.username,
                     message: text,
@@ -126,10 +159,9 @@ async function start() {
             const info = clients.get(ws);
             if (info) {
                 clients.delete(ws);
-                // Free the username so someone else (on any instance) can take it.
-                await publisher.sRem(usernameSetKey(info.room), info.username);
+                await redisClient.sRem(usernameSetKey(info.room), info.username);
                 console.log(`[${SERVER_ID}] ${info.username} left #${info.room}`);
-                publishToRoom(info.room, {
+                await appendToStream(info.room, {
                     type: 'system',
                     message: `${info.username} left #${info.room} (was on ${SERVER_ID})`,
                     timestamp: new Date().toISOString()
